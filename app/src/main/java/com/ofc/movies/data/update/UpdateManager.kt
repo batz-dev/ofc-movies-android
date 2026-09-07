@@ -112,11 +112,17 @@ object UpdateManager {
         updateInfo: AppUpdateInfo,
         onProgress: (downloadedBytes: Long, totalBytes: Long, percent: Int) -> Unit
     ): File = withContext(Dispatchers.IO) {
-        createNotificationChannel(context)
-        val notifManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        try {
+            createNotificationChannel(context)
+        } catch (e: Exception) {}
+        val notifManager = try {
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        } catch (e: Exception) { null }
 
-        val updatesDir = File(context.getExternalFilesDir(null), "updates").apply { mkdirs() }
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val updatesDir = File(baseDir, "updates").apply { mkdirs() }
         val apkFile = File(updatesDir, "OFC-Movies-${updateInfo.versionName}.apk")
+        if (apkFile.exists()) apkFile.delete()
 
         val request = Request.Builder()
             .url(updateInfo.apkUrl)
@@ -137,6 +143,7 @@ object UpdateManager {
                 var bytesReadTotal = 0L
                 var read: Int
                 var lastNotifTime = 0L
+                var lastProgressTime = 0L
 
                 while (input.read(buffer).also { read = it } != -1) {
                     output.write(buffer, 0, read)
@@ -146,57 +153,74 @@ object UpdateManager {
                         ((bytesReadTotal * 100) / contentLength).toInt().coerceIn(0, 100)
                     } else 0
 
-                    onProgress(bytesReadTotal, contentLength, percent)
-
                     val now = System.currentTimeMillis()
+                    if (now - lastProgressTime > 150 || percent == 100) {
+                        lastProgressTime = now
+                        withContext(Dispatchers.Main) {
+                            onProgress(bytesReadTotal, contentLength, percent)
+                        }
+                    }
+
                     if (now - lastNotifTime > 600 || percent == 100) {
                         lastNotifTime = now
-                        showDownloadProgressNotification(context, notifManager, updateInfo.versionName, percent)
+                        try {
+                            notifManager?.let { showDownloadProgressNotification(context, it, updateInfo.versionName, percent) }
+                        } catch (e: Exception) {}
                     }
                 }
                 output.flush()
             }
         }
 
-        showDownloadCompleteNotification(context, notifManager, updateInfo.versionName, apkFile)
+        try {
+            notifManager?.let { showDownloadCompleteNotification(context, it, updateInfo.versionName, apkFile) }
+        } catch (e: Exception) {}
+
         apkFile
     }
 
     fun installApk(context: Context, apkFile: File) {
-        if (!apkFile.exists()) {
-            Toast.makeText(context, "Update file not found", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (!context.packageManager.canRequestPackageInstalls()) {
-                Toast.makeText(
-                    context,
-                    "Please allow OFC Movies to install app updates",
-                    Toast.LENGTH_LONG
-                ).show()
-                val permIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
-                    data = Uri.parse("package:${context.packageName}")
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(permIntent)
+        try {
+            if (!apkFile.exists()) {
+                Toast.makeText(context, "Update file not found", Toast.LENGTH_SHORT).show()
                 return
             }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (!context.packageManager.canRequestPackageInstalls()) {
+                    Toast.makeText(
+                        context,
+                        "Please allow OFC Movies to install app updates",
+                        Toast.LENGTH_LONG
+                    ).show()
+                    val permIntent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                        data = Uri.parse("package:${context.packageName}")
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(permIntent)
+                    return
+                }
+            }
+
+            val apkUri = FileProvider.getUriForFile(
+                context.applicationContext,
+                "${context.packageName}.fileprovider",
+                apkFile
+            )
+
+            val installIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(apkUri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+
+            context.startActivity(installIntent)
+        } catch (e: Exception) {
+            android.util.Log.e("UpdateManager", "Failed to launch installer", e)
+            try {
+                Toast.makeText(context, "Failed to launch installer: ${e.message}", Toast.LENGTH_LONG).show()
+            } catch (e2: Exception) {}
         }
-
-        val apkUri = FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            apkFile
-        )
-
-        val installIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(apkUri, "application/vnd.android.package-archive")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-
-        context.startActivity(installIntent)
     }
 
     private fun createNotificationChannel(context: Context) {
@@ -219,15 +243,17 @@ object UpdateManager {
         version: String,
         percent: Int
     ) {
-        val notif = NotificationCompat.Builder(context, NOTIF_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_download_notif)
-            .setContentTitle("Downloading OFC Movies v$version")
-            .setContentText("Download in progress: $percent%")
-            .setProgress(100, percent, false)
-            .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .build()
-        nm.notify(NOTIF_ID, notif)
+        try {
+            val notif = NotificationCompat.Builder(context, NOTIF_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_download_notif)
+                .setContentTitle("Downloading OFC Movies v$version")
+                .setContentText("Download in progress: $percent%")
+                .setProgress(100, percent, false)
+                .setOngoing(true)
+                .setOnlyAlertOnce(true)
+                .build()
+            nm.notify(NOTIF_ID, notif)
+        } catch (e: Exception) {}
     }
 
     private fun showDownloadCompleteNotification(

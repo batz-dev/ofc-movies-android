@@ -478,6 +478,8 @@ fun DownloadsScreen(
                                                 item = epItem,
                                                 inAppProgress = inAppProgressMap[epItem.id],
                                                 onPlay = { onPlayOffline(epItem.id, epItem.title) },
+                                                onPause = { appDownloadManager.pauseTask(epItem.id) },
+                                                onResume = { appDownloadManager.resumeTask(epItem.id) },
                                                 onDelete = { itemToDelete = epItem }
                                             )
                                         }
@@ -528,6 +530,8 @@ fun DownloadsScreen(
                             item = movieItem,
                             inAppProgress = inAppProgressMap[movieItem.id],
                             onPlay = { onPlayOffline(movieItem.id, movieItem.title) },
+                            onPause = { appDownloadManager.pauseTask(movieItem.id) },
+                            onResume = { appDownloadManager.resumeTask(movieItem.id) },
                             onDelete = { itemToDelete = movieItem }
                         )
                     }
@@ -631,12 +635,35 @@ fun DownloadMovieCard(
     item: DownloadedItem,
     inAppProgress: com.ofc.movies.data.download.DownloadProgress?,
     onPlay: () -> Unit,
+    onPause: () -> Unit = {},
+    onResume: () -> Unit = {},
     onDelete: () -> Unit
 ) {
     val isDownloading = inAppProgress?.status == "Downloading" || item.status == "Downloading"
+    val isPaused = inAppProgress?.status == "Paused" || item.status == "Paused"
     val isQueued = inAppProgress?.status == "Queued" || item.status == "Queued"
     val isFailed = item.status == "Failed"
-    val isReady = item.status == "Ready" || (!isDownloading && !isQueued && !isFailed)
+    val isReady = item.status == "Ready" || (!isDownloading && !isPaused && !isQueued && !isFailed)
+
+    val downloadedBytes = when {
+        inAppProgress != null && inAppProgress.bytesDownloaded > 0 -> inAppProgress.bytesDownloaded
+        item.bytesDownloaded > 0 -> item.bytesDownloaded
+        else -> 0L
+    }
+    val totalBytes = when {
+        inAppProgress != null && inAppProgress.totalBytes > 0 -> inAppProgress.totalBytes
+        item.totalBytes > 0 -> item.totalBytes
+        else -> 0L
+    }
+    val downloadedStr = formatDownloadSize(downloadedBytes, 0)
+    val totalStr = if (totalBytes > 0) formatDownloadSize(totalBytes, 0) else item.sizeText
+    val pct = when {
+        inAppProgress != null && inAppProgress.percentage > 0 -> "${inAppProgress.percentage}%"
+        totalBytes > 0 && downloadedBytes > 0 -> "${((downloadedBytes * 100) / totalBytes).toInt().coerceIn(0, 99)}%"
+        isDownloading -> "Downloading"
+        isPaused -> "Paused"
+        else -> ""
+    }
 
     Surface(
         shape = RoundedCornerShape(16.dp),
@@ -694,22 +721,20 @@ fun DownloadMovieCard(
                     Text(text = "•", color = TextSecondary, style = MaterialTheme.typography.labelSmall)
 
                     if (isDownloading) {
-                        val downloadedStr = if (inAppProgress != null && inAppProgress.bytesDownloaded > 0) {
-                            formatDownloadSize(inAppProgress.bytesDownloaded, 0)
-                        } else "0 MB"
-                        val totalStr = if (inAppProgress != null && inAppProgress.totalBytes > 0) {
-                            formatDownloadSize(inAppProgress.totalBytes, 0)
-                        } else item.sizeText
-
-                        val pct = if (inAppProgress != null && inAppProgress.percentage > 0) "${inAppProgress.percentage}%" else "Downloading"
                         Text(
                             text = "$downloadedStr / $totalStr ($pct)",
                             style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                             color = PrimaryRed
                         )
+                    } else if (isPaused) {
+                        Text(
+                            text = "Paused • $downloadedStr / $totalStr ($pct)",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = RatingGold
+                        )
                     } else if (isQueued) {
                         Text(
-                            text = "${item.sizeText} • Waiting in queue",
+                            text = "Waiting in queue • $totalStr",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSecondary
                         )
@@ -734,15 +759,13 @@ fun DownloadMovieCard(
                     }
                 }
 
-                if (isDownloading || isQueued) {
+                if (isDownloading || isPaused || isQueued) {
                     Spacer(modifier = Modifier.height(8.dp))
-                    val progressFraction = if (isDownloading && inAppProgress != null) {
-                        if (inAppProgress.percentage > 0) {
-                            (inAppProgress.percentage.toFloat() / 100f).coerceIn(0f, 1f)
-                        } else if (inAppProgress.totalBytes > 0 && inAppProgress.bytesDownloaded > 0) {
-                            (inAppProgress.bytesDownloaded.toFloat() / inAppProgress.totalBytes.toFloat()).coerceIn(0f, 1f)
-                        } else 0.05f
-                    } else 0f
+                    val progressFraction = if (totalBytes > 0 && downloadedBytes > 0) {
+                        (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0.02f, 1f)
+                    } else if (inAppProgress != null && inAppProgress.percentage > 0) {
+                        (inAppProgress.percentage.toFloat() / 100f).coerceIn(0f, 1f)
+                    } else if (isDownloading) 0.05f else 0f
 
                     LinearProgressIndicator(
                         progress = { progressFraction },
@@ -750,16 +773,46 @@ fun DownloadMovieCard(
                             .fillMaxWidth()
                             .height(5.dp)
                             .clip(RoundedCornerShape(3.dp)),
-                        color = PrimaryRed,
+                        color = if (isPaused) RatingGold else PrimaryRed,
                         trackColor = DarkSurfaceElevated
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.width(10.dp))
+            Spacer(modifier = Modifier.width(8.dp))
 
             // Actions
-            if (isReady) {
+            if (isDownloading) {
+                IconButton(
+                    onClick = onPause,
+                    modifier = Modifier
+                        .size(38.dp)
+                        .background(DarkSurfaceElevated, CircleShape)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Pause,
+                        contentDescription = "Pause",
+                        tint = RatingGold,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+            } else if (isPaused) {
+                IconButton(
+                    onClick = onResume,
+                    modifier = Modifier
+                        .size(38.dp)
+                        .background(PrimaryRed, CircleShape)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.PlayArrow,
+                        contentDescription = "Resume",
+                        tint = Color.White,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(4.dp))
+            } else if (isReady) {
                 IconButton(
                     onClick = onPlay,
                     modifier = Modifier
@@ -773,6 +826,7 @@ fun DownloadMovieCard(
                         modifier = Modifier.size(24.dp)
                     )
                 }
+                Spacer(modifier = Modifier.width(4.dp))
             }
 
             IconButton(
@@ -795,12 +849,35 @@ fun DownloadEpisodeItemRow(
     item: DownloadedItem,
     inAppProgress: com.ofc.movies.data.download.DownloadProgress?,
     onPlay: () -> Unit,
+    onPause: () -> Unit = {},
+    onResume: () -> Unit = {},
     onDelete: () -> Unit
 ) {
     val isDownloading = inAppProgress?.status == "Downloading" || item.status == "Downloading"
+    val isPaused = inAppProgress?.status == "Paused" || item.status == "Paused"
     val isQueued = inAppProgress?.status == "Queued" || item.status == "Queued"
     val isFailed = item.status == "Failed"
-    val isReady = item.status == "Ready" || (!isDownloading && !isQueued && !isFailed)
+    val isReady = item.status == "Ready" || (!isDownloading && !isPaused && !isQueued && !isFailed)
+
+    val downloadedBytes = when {
+        inAppProgress != null && inAppProgress.bytesDownloaded > 0 -> inAppProgress.bytesDownloaded
+        item.bytesDownloaded > 0 -> item.bytesDownloaded
+        else -> 0L
+    }
+    val totalBytes = when {
+        inAppProgress != null && inAppProgress.totalBytes > 0 -> inAppProgress.totalBytes
+        item.totalBytes > 0 -> item.totalBytes
+        else -> 0L
+    }
+    val downloadedStr = formatDownloadSize(downloadedBytes, 0)
+    val totalStr = if (totalBytes > 0) formatDownloadSize(totalBytes, 0) else item.sizeText
+    val pct = when {
+        inAppProgress != null && inAppProgress.percentage > 0 -> "${inAppProgress.percentage}%"
+        totalBytes > 0 && downloadedBytes > 0 -> "${((downloadedBytes * 100) / totalBytes).toInt().coerceIn(0, 99)}%"
+        isDownloading -> "Downloading"
+        isPaused -> "Paused"
+        else -> ""
+    }
 
     Row(
         modifier = Modifier
@@ -829,6 +906,13 @@ fun DownloadEpisodeItemRow(
                     color = PrimaryRed,
                     strokeWidth = 2.5.dp,
                     trackColor = DarkCard
+                )
+            } else if (isPaused) {
+                Icon(
+                    imageVector = Icons.Filled.Pause,
+                    contentDescription = "Paused",
+                    tint = RatingGold,
+                    modifier = Modifier.size(18.dp)
                 )
             } else if (isQueued) {
                 Icon(
@@ -870,14 +954,16 @@ fun DownloadEpisodeItemRow(
                 Text(text = " • ", color = TextSecondary, style = MaterialTheme.typography.labelSmall)
 
                 if (isDownloading) {
-                    val downloadedStr = if (inAppProgress != null && inAppProgress.bytesDownloaded > 0) {
-                        formatDownloadSize(inAppProgress.bytesDownloaded, 0)
-                    } else "0 MB"
-                    val pct = if (inAppProgress != null && inAppProgress.percentage > 0) "${inAppProgress.percentage}%" else "Downloading"
                     Text(
-                        text = "$downloadedStr ($pct)",
+                        text = "$downloadedStr / $totalStr ($pct)",
                         style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                         color = PrimaryRed
+                    )
+                } else if (isPaused) {
+                    Text(
+                        text = "Paused • $downloadedStr / $totalStr ($pct)",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = RatingGold
                     )
                 } else if (isQueued) {
                     Text(text = "Queued", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
@@ -888,19 +974,48 @@ fun DownloadEpisodeItemRow(
                 }
             }
 
-            if (isDownloading) {
+            if (isDownloading || isPaused) {
                 Spacer(modifier = Modifier.height(6.dp))
-                val progressFraction = if (inAppProgress != null && inAppProgress.percentage > 0) {
+                val progressFraction = if (totalBytes > 0 && downloadedBytes > 0) {
+                    (downloadedBytes.toFloat() / totalBytes.toFloat()).coerceIn(0.02f, 1f)
+                } else if (inAppProgress != null && inAppProgress.percentage > 0) {
                     (inAppProgress.percentage.toFloat() / 100f).coerceIn(0f, 1f)
-                } else 0.05f
+                } else if (isDownloading) 0.05f else 0f
+
                 LinearProgressIndicator(
                     progress = { progressFraction },
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(3.dp)
                         .clip(RoundedCornerShape(2.dp)),
-                    color = PrimaryRed,
+                    color = if (isPaused) RatingGold else PrimaryRed,
                     trackColor = DarkSurfaceElevated
+                )
+            }
+        }
+
+        if (isDownloading) {
+            IconButton(
+                onClick = onPause,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Pause,
+                    contentDescription = "Pause",
+                    tint = RatingGold,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        } else if (isPaused) {
+            IconButton(
+                onClick = onResume,
+                modifier = Modifier.size(32.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.PlayArrow,
+                    contentDescription = "Resume",
+                    tint = PrimaryRed,
+                    modifier = Modifier.size(18.dp)
                 )
             }
         }

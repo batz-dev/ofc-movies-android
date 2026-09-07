@@ -194,6 +194,28 @@ class DownloadService : Service() {
                     return@download
                 }
 
+                if (downloadManager.isPaused(task.id)) {
+                    try { downloader?.cancel() } catch (e: Exception) {}
+                    val total = if (contentLength > 0) contentLength else estimatedTotal
+                    val percent = when {
+                        percentDownloaded in 0.01f..100.0f -> percentDownloaded.toInt().coerceIn(0, 100)
+                        total > 0 && bytesDownloaded > 0 -> ((bytesDownloaded * 100) / total).toInt().coerceIn(0, 99)
+                        else -> 0
+                    }
+                    downloadManager.updateProgress(
+                        task.id,
+                        DownloadProgress(
+                            taskId = task.id,
+                            bytesDownloaded = bytesDownloaded,
+                            totalBytes = total,
+                            percentage = percent,
+                            status = "Paused"
+                        )
+                    )
+                    storageManager.updateDownloadProgress(task.id, "Paused", bytesDownloaded, total)
+                    return@download
+                }
+
                 maxBytesDownloaded = maxOf(maxBytesDownloaded, bytesDownloaded)
                 val now = System.currentTimeMillis()
                 if (now - lastUpdateMs > 250) {
@@ -213,6 +235,7 @@ class DownloadService : Service() {
                             status = "Downloading"
                         )
                     )
+                    storageManager.updateDownloadProgress(task.id, "Downloading", bytesDownloaded, total)
 
                     val notif = buildNotification(task.displayTitle, percent, bytesDownloaded, total)
                     try {
@@ -222,7 +245,7 @@ class DownloadService : Service() {
                 }
             }
 
-            if (downloadManager.isCancelled(task.id)) {
+            if (downloadManager.isCancelled(task.id) || downloadManager.isPaused(task.id)) {
                 return false
             }
 
@@ -245,10 +268,13 @@ class DownloadService : Service() {
                 localUri = "cache://${task.streamUrl}",
                 sizeText = finalSizeText
             )
+            storageManager.updateDownloadProgress(task.id, "Ready", finalTotal, finalTotal)
             true
         } catch (e: Exception) {
             android.util.Log.e("DownloadService", "DASH download failed for ${task.displayTitle}", e)
-            storageManager.updateDownloadStatus(task.id, "Failed")
+            if (!downloadManager.isPaused(task.id) && !downloadManager.isCancelled(task.id)) {
+                storageManager.updateDownloadStatus(task.id, "Failed")
+            }
             false
         } finally {
             executor.shutdown()
@@ -257,11 +283,20 @@ class DownloadService : Service() {
 
     private fun downloadProgressiveTask(task: DownloadTask): Boolean {
         var outputStream: OutputStream? = null
-        var createdUri: Uri? = null
+        val safeTitle = task.displayTitle.replace(Regex("[^a-zA-Z0-9._ -]"), "_")
+        val fileName = "${safeTitle}_${task.quality}.mp4"
+
+        val baseDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+            ?: Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val ofcDir = File(baseDir, "ofcmovies")
+        if (!ofcDir.exists()) ofcDir.mkdirs()
+        val file = File(ofcDir, fileName)
+
+        val existingBytes = if (file.exists()) file.length() else 0L
 
         return try {
             val cleanCookie = task.signCookie?.replace("\r", "")?.replace("\n", "")?.trim()?.trimEnd(';') ?: ""
-            val req = Request.Builder()
+            val reqBuilder = Request.Builder()
                 .url(task.streamUrl)
                 .header("User-Agent", MovieBoxSigner.ANDROID_USER_AGENT)
                 .header("Referer", "https://www.movieboxpro.app/")
@@ -269,68 +304,54 @@ class DownloadService : Service() {
                     if (cleanCookie.isNotEmpty()) {
                         header("Cookie", cleanCookie)
                     }
+                    if (existingBytes > 0) {
+                        header("Range", "bytes=$existingBytes-")
+                    }
                 }
-                .build()
 
-            val response = okHttpClient.newCall(req).execute()
+            val response = okHttpClient.newCall(reqBuilder.build()).execute()
             android.util.Log.d("DownloadService", "Download response code: ${response.code} for ${task.displayTitle}")
-            if (!response.isSuccessful) {
+
+            val isPartial = response.code == 206
+            if (!response.isSuccessful && !isPartial) {
                 android.util.Log.e("DownloadService", "Download failed: HTTP ${response.code} ${response.message}")
-                storageManager.updateDownloadStatus(task.id, "Failed")
+                if (!downloadManager.isPaused(task.id) && !downloadManager.isCancelled(task.id)) {
+                    storageManager.updateDownloadStatus(task.id, "Failed")
+                }
                 return false
             }
 
             val body = response.body ?: return false
-            val contentLength = body.contentLength().coerceAtLeast(0L)
-
-            val safeTitle = task.displayTitle.replace(Regex("[^a-zA-Z0-9._ -]"), "_")
-            val fileName = "${safeTitle}_${task.quality}.mp4"
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                try {
-                    val contentValues = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                        put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/ofcmovies/")
-                        put(MediaStore.MediaColumns.IS_PENDING, 1)
-                    }
-                    createdUri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-                    if (createdUri != null) {
-                        outputStream = contentResolver.openOutputStream(createdUri)
-                    }
-                } catch (e: Exception) {
-                    android.util.Log.e("DownloadService", "MediaStore insert failed, falling back to private storage", e)
-                }
+            val remainingLength = body.contentLength().coerceAtLeast(0L)
+            val totalContentLength = if (isPartial && existingBytes > 0) {
+                existingBytes + remainingLength
+            } else if (remainingLength > 0) {
+                remainingLength
+            } else if (task.estimatedSizeBytes > 0) {
+                task.estimatedSizeBytes
+            } else {
+                parseSizeTextToBytes(task.sizeText)
             }
 
-            // Fallback for Android < Q or if MediaStore insert was restricted
-            if (outputStream == null) {
-                val baseDir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                    ?: Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                val ofcDir = File(baseDir, "ofcmovies")
-                if (!ofcDir.exists()) ofcDir.mkdirs()
-                val file = File(ofcDir, fileName)
-                outputStream = FileOutputStream(file)
-                createdUri = Uri.fromFile(file)
-            }
+            val isAppend = isPartial && existingBytes > 0
+            outputStream = FileOutputStream(file, isAppend)
+            var totalBytesDownloaded = if (isAppend) existingBytes else 0L
 
-            val out = outputStream ?: return false
+            val out = outputStream
 
-            // Immediately set status as Downloading with total bytes
             downloadManager.updateProgress(
                 task.id,
                 DownloadProgress(
                     taskId = task.id,
-                    bytesDownloaded = 0L,
-                    totalBytes = contentLength,
-                    percentage = 0,
+                    bytesDownloaded = totalBytesDownloaded,
+                    totalBytes = totalContentLength,
+                    percentage = if (totalContentLength > 0) ((totalBytesDownloaded * 100) / totalContentLength).toInt().coerceIn(0, 100) else 0,
                     status = "Downloading"
                 )
             )
 
             val buffer = ByteArray(64 * 1024)
             var bytesRead: Int
-            var totalBytesDownloaded = 0L
             var lastUpdateMs = 0L
             val inputStream = body.byteStream()
 
@@ -338,9 +359,26 @@ class DownloadService : Service() {
                 if (downloadManager.isCancelled(task.id)) {
                     out.close()
                     outputStream = null
-                    if (createdUri != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        contentResolver.delete(createdUri, null, null)
-                    }
+                    try { if (file.exists()) file.delete() } catch (e: Exception) {}
+                    return false
+                }
+
+                if (downloadManager.isPaused(task.id)) {
+                    out.flush()
+                    out.close()
+                    outputStream = null
+                    val percent = if (totalContentLength > 0) ((totalBytesDownloaded * 100) / totalContentLength).toInt().coerceIn(0, 100) else 0
+                    downloadManager.updateProgress(
+                        task.id,
+                        DownloadProgress(
+                            taskId = task.id,
+                            bytesDownloaded = totalBytesDownloaded,
+                            totalBytes = totalContentLength,
+                            percentage = percent,
+                            status = "Paused"
+                        )
+                    )
+                    storageManager.updateDownloadProgress(task.id, "Paused", totalBytesDownloaded, totalContentLength)
                     return false
                 }
 
@@ -349,22 +387,21 @@ class DownloadService : Service() {
 
                 val now = System.currentTimeMillis()
                 if (now - lastUpdateMs > 300) {
-                    val percent = if (contentLength > 0) ((totalBytesDownloaded * 100) / contentLength).toInt().coerceIn(0, 100) else 0
+                    val percent = if (totalContentLength > 0) ((totalBytesDownloaded * 100) / totalContentLength).toInt().coerceIn(0, 100) else 0
                     val progress = DownloadProgress(
                         taskId = task.id,
                         bytesDownloaded = totalBytesDownloaded,
-                        totalBytes = contentLength,
+                        totalBytes = totalContentLength,
                         percentage = percent,
                         status = "Downloading"
                     )
                     downloadManager.updateProgress(task.id, progress)
+                    storageManager.updateDownloadProgress(task.id, "Downloading", totalBytesDownloaded, totalContentLength)
 
-                    val notif = buildNotification(task.displayTitle, percent, totalBytesDownloaded, contentLength)
+                    val notif = buildNotification(task.displayTitle, percent, totalBytesDownloaded, totalContentLength)
                     try {
                         notificationManager.notify(NOTIFICATION_ID, notif)
-                    } catch (e: Throwable) {
-                        android.util.Log.e("DownloadService", "Failed to update notification progress", e)
-                    }
+                    } catch (e: Throwable) {}
                     lastUpdateMs = now
                 }
             }
@@ -373,26 +410,21 @@ class DownloadService : Service() {
             out.close()
             outputStream = null
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && createdUri != null) {
-                try {
-                    val values = ContentValues().apply {
-                        put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    }
-                    contentResolver.update(createdUri, values, null, null)
-                } catch (e: Exception) {}
-            }
-
+            val createdUri = Uri.fromFile(file)
             val sizeFormatted = formatDownloadSize(totalBytesDownloaded, 0)
             storageManager.updateDownloadStatus(
                 id = task.id,
                 status = "Ready",
-                localUri = createdUri?.toString() ?: "",
+                localUri = createdUri.toString(),
                 sizeText = sizeFormatted
             )
+            storageManager.updateDownloadProgress(task.id, "Ready", totalBytesDownloaded, totalContentLength)
             true
         } catch (e: Exception) {
             android.util.Log.e("DownloadService", "Error during download task", e)
-            storageManager.updateDownloadStatus(task.id, "Failed")
+            if (!downloadManager.isPaused(task.id) && !downloadManager.isCancelled(task.id)) {
+                storageManager.updateDownloadStatus(task.id, "Failed")
+            }
             false
         } finally {
             try { outputStream?.close() } catch (e: Exception) {}

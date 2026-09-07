@@ -21,7 +21,9 @@ data class DownloadedItem(
     val movieId: String = "",
     val seriesName: String = "",
     val season: Int = 0,
-    val episode: Int = 0
+    val episode: Int = 0,
+    val bytesDownloaded: Long = 0L,
+    val totalBytes: Long = 0L
 )
 
 class StorageManager private constructor(context: Context) {
@@ -117,6 +119,20 @@ class StorageManager private constructor(context: Context) {
                 status = status,
                 localUri = localUri ?: item.localUri,
                 sizeText = sizeText ?: item.sizeText
+            )
+            prefs.edit().putString("downloads", gson.toJson(list)).apply()
+        }
+    }
+
+    fun updateDownloadProgress(id: String, status: String, bytesDownloaded: Long, totalBytes: Long) {
+        val list = getDownloads().toMutableList()
+        val index = list.indexOfFirst { it.id == id }
+        if (index >= 0) {
+            val item = list[index]
+            list[index] = item.copy(
+                status = status,
+                bytesDownloaded = bytesDownloaded,
+                totalBytes = if (totalBytes > 0) totalBytes else item.totalBytes
             )
             prefs.edit().putString("downloads", gson.toJson(list)).apply()
         }

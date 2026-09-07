@@ -163,8 +163,10 @@ fun AppUpdateDialog(
                         Spacer(modifier = Modifier.height(8.dp))
                         val currentMb = downloadedBytes.toDouble() / (1024 * 1024)
                         val totalMb = totalBytes.toDouble() / (1024 * 1024)
+                        val curStr = "%.1f".format(currentMb)
+                        val totStr = if (totalMb > 0) "%.1f".format(totalMb) else "?"
                         Text(
-                            text = "Downloading: $downloadPercent% (%.1f / %.1f MB)".format(currentMb, totalMb),
+                            text = "Downloading: $downloadPercent% ($curStr / $totStr MB)",
                             color = TextSecondary,
                             style = MaterialTheme.typography.bodySmall
                         )
@@ -199,14 +201,14 @@ fun AppUpdateDialog(
                     Button(
                         onClick = {
                             if (downloadedFile != null && downloadedFile?.exists() == true) {
-                                UpdateManager.installApk(context, downloadedFile!!)
+                                UpdateManager.installApk(context.applicationContext, downloadedFile!!)
                             } else {
                                 isDownloading = true
                                 errorMessage = null
-                                scope.launch {
+                                scope.launch(kotlinx.coroutines.Dispatchers.Main) {
                                     try {
                                         val file = UpdateManager.downloadApk(
-                                            context = context,
+                                            context = context.applicationContext,
                                             updateInfo = updateInfo,
                                             onProgress = { cur, tot, pct ->
                                                 downloadedBytes = cur
@@ -216,7 +218,7 @@ fun AppUpdateDialog(
                                         )
                                         downloadedFile = file
                                         isDownloading = false
-                                        UpdateManager.installApk(context, file)
+                                        UpdateManager.installApk(context.applicationContext, file)
                                     } catch (e: Exception) {
                                         isDownloading = false
                                         errorMessage = "Download failed: ${e.localizedMessage ?: "Unknown error"}"

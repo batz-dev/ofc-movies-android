@@ -68,6 +68,7 @@ fun MovieDetailScreen(
     val storageManager = remember { StorageManager.getInstance(context) }
     val repository = remember { MovieRepository(storageManager = storageManager) }
     val downloadManager = remember { AppDownloadManager.getInstance(context) }
+    val inAppProgressMap by downloadManager.progressMap.collectAsState()
     val scope = rememberCoroutineScope()
 
     val notifPermissionLauncher = rememberLauncherForActivityResult(
@@ -425,10 +426,28 @@ fun MovieDetailScreen(
                                     .clip(CircleShape)
                                     .background(DarkCard)
                             ) {
+                                val activeDownload = inAppProgressMap.values.firstOrNull { prog ->
+                                    (prog.taskId.startsWith(movieId) || (selectedDubId.isNotEmpty() && prog.taskId.startsWith(selectedDubId))) &&
+                                    (prog.status == "Downloading" || prog.status == "Paused" || prog.status == "Queued")
+                                }
+
+                                val dlIcon = when {
+                                    activeDownload?.status == "Downloading" -> Icons.Filled.CloudDownload
+                                    activeDownload?.status == "Paused" -> Icons.Filled.Pause
+                                    isMovieDownloaded -> Icons.Filled.Check
+                                    else -> Icons.Filled.ArrowDownward
+                                }
+                                val dlTint = when {
+                                    activeDownload?.status == "Downloading" -> PrimaryRed
+                                    activeDownload?.status == "Paused" -> RatingGold
+                                    isMovieDownloaded -> RatingGold
+                                    else -> Color.White
+                                }
+
                                 Icon(
-                                    imageVector = if (isMovieDownloaded) Icons.Filled.Check else Icons.Filled.ArrowDownward,
+                                    imageVector = dlIcon,
                                     contentDescription = "Download",
-                                    tint = if (isMovieDownloaded) RatingGold else Color.White
+                                    tint = dlTint
                                 )
                             }
 
@@ -459,6 +478,122 @@ fun MovieDetailScreen(
                                     contentDescription = "My List",
                                     tint = if (isInMyList) PrimaryRed else Color.White
                                 )
+                            }
+                        }
+
+                        // Live In-App Download Progress Banner
+                        val activeDownloadForBanner = inAppProgressMap.values.firstOrNull { prog ->
+                            (prog.taskId.startsWith(movieId) || (selectedDubId.isNotEmpty() && prog.taskId.startsWith(selectedDubId))) &&
+                            (prog.status == "Downloading" || prog.status == "Paused" || prog.status == "Queued")
+                        }
+
+                        if (activeDownloadForBanner != null) {
+                            val isPaused = activeDownloadForBanner.status == "Paused"
+                            val isQueued = activeDownloadForBanner.status == "Queued"
+                            val downloadedStr = formatDownloadSize(activeDownloadForBanner.bytesDownloaded, 0)
+                            val totalStr = if (activeDownloadForBanner.totalBytes > 0) formatDownloadSize(activeDownloadForBanner.totalBytes, 0) else "Calculating..."
+                            val pct = if (activeDownloadForBanner.percentage > 0) "${activeDownloadForBanner.percentage}%" else ""
+
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = DarkCard,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 12.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(14.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Icon(
+                                                imageVector = if (isPaused) Icons.Filled.Pause else if (isQueued) Icons.Filled.Schedule else Icons.Filled.CloudDownload,
+                                                contentDescription = null,
+                                                tint = if (isPaused) RatingGold else PrimaryRed,
+                                                modifier = Modifier.size(20.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            val titlePrefix = if (isPaused) "Download Paused" else if (isQueued) "Download Queued" else "Downloading"
+                                            val pctLabel = if (pct.isNotEmpty()) " • $pct" else ""
+                                            Text(
+                                                text = "$titlePrefix$pctLabel",
+                                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                                color = TextPrimary
+                                            )
+                                        }
+
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            if (!isPaused && !isQueued) {
+                                                IconButton(
+                                                    onClick = { downloadManager.pauseTask(activeDownloadForBanner.taskId) },
+                                                    modifier = Modifier.size(32.dp)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.Pause,
+                                                        contentDescription = "Pause",
+                                                        tint = RatingGold,
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                }
+                                            } else if (isPaused) {
+                                                IconButton(
+                                                    onClick = { downloadManager.resumeTask(activeDownloadForBanner.taskId) },
+                                                    modifier = Modifier.size(32.dp)
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.PlayArrow,
+                                                        contentDescription = "Resume",
+                                                        tint = PrimaryRed,
+                                                        modifier = Modifier.size(18.dp)
+                                                    )
+                                                }
+                                            }
+
+                                            IconButton(
+                                                onClick = { downloadManager.cancelTask(activeDownloadForBanner.taskId) },
+                                                modifier = Modifier.size(32.dp)
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Close,
+                                                    contentDescription = "Cancel",
+                                                    tint = TextSecondary,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.height(4.dp))
+
+                                    Text(
+                                        text = "$downloadedStr / $totalStr",
+                                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                                        color = TextSecondary
+                                    )
+
+                                    Spacer(modifier = Modifier.height(8.dp))
+
+                                    val progressFraction = if (activeDownloadForBanner.percentage > 0) {
+                                        (activeDownloadForBanner.percentage.toFloat() / 100f).coerceIn(0f, 1f)
+                                    } else if (activeDownloadForBanner.totalBytes > 0 && activeDownloadForBanner.bytesDownloaded > 0) {
+                                        (activeDownloadForBanner.bytesDownloaded.toFloat() / activeDownloadForBanner.totalBytes.toFloat()).coerceIn(0f, 1f)
+                                    } else if (!isPaused && !isQueued) 0.05f else 0f
+
+                                    LinearProgressIndicator(
+                                        progress = { progressFraction },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(4.dp)
+                                            .clip(RoundedCornerShape(2.dp)),
+                                        color = if (isPaused) RatingGold else PrimaryRed,
+                                        trackColor = DarkSurfaceElevated
+                                    )
+                                }
                             }
                         }
 
